@@ -1,0 +1,11 @@
+export interface FtpItem {
+  name: string;
+  type: 'directory' | 'file' | 'link';
+  size: number;
+  modifiedAt: string;
+}
+
+export interface FtpListResponse {
+  path: string;
+  items: FtpItem[];
+}

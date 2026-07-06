@@ -1,290 +1,387 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
-import NetworkSelector from '@/components/NetworkSelector';
-import ScanPanel from '@/components/ScanPanel';
-import ManualConnection from '@/components/ManualConnection';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { FolderSearch, Network, Plus, RefreshCw, Server } from 'lucide-react';
+import ConnectionCard from '@/components/ConnectionCard';
 import FileBrowser from '@/components/FileBrowser';
+import { ConnectionEntry, LoginValues } from '@/types/connection';
 import { FtpItem } from '@/types/ftp';
-import { Network, FolderTree, Power, CheckCircle, Shield, Wifi } from 'lucide-react';
+import { NetworkInterfaceInfo, ScanResult } from '@/types/network';
+
+const DEFAULT_PORTS = [21, 2121, 2221, 8021, 3721];
+const PATH_STORAGE_KEY = 'local-ftp:last-paths:v1';
 
 export default function Home() {
-  const [selectedCidr, setSelectedCidr] = useState('');
-  const [isCloud, setIsCloud] = useState(false);
+  const started = useRef(false);
+  const [connections, setConnections] = useState<Record<string, ConnectionEntry>>({});
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
+  const [subnets, setSubnets] = useState<string[]>([]);
+  const [scanProgress, setScanProgress] = useState('');
+  const [scanning, setScanning] = useState(false);
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+  const [showManual, setShowManual] = useState(false);
+  const [manualHost, setManualHost] = useState('');
+  const [manualPort, setManualPort] = useState(2121);
 
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      const hostname = window.location.hostname;
-      if (
-        hostname !== 'localhost' &&
-        hostname !== '127.0.0.1' &&
-        hostname !== '::1' &&
-        !hostname.startsWith('192.168.') &&
-        !hostname.startsWith('10.')
-      ) {
-        // Defer to avoid ESLint warning on synchronous state setting inside useEffect
-        const timer = setTimeout(() => {
-          setIsCloud(true);
-        }, 0);
-        return () => clearTimeout(timer);
+  const updateConnection = useCallback(
+    (key: string, update: Partial<ConnectionEntry> | ((entry: ConnectionEntry) => Partial<ConnectionEntry>)) => {
+      setConnections((current) => {
+        const entry = current[key];
+        if (!entry) return current;
+        const patch = typeof update === 'function' ? update(entry) : update;
+        return { ...current, [key]: { ...entry, ...patch } };
+      });
+    },
+    []
+  );
+
+  const scanNetworks = useCallback(async () => {
+    setScanning(true);
+    setDiscoveryError(null);
+    setScanProgress('Detecting local networks');
+
+    try {
+      const interfaceResponse = await fetch('/api/network/interfaces');
+      const interfaces = (await interfaceResponse.json()) as NetworkInterfaceInfo[];
+      if (!interfaceResponse.ok || !Array.isArray(interfaces)) {
+        throw new Error('Could not detect local network interfaces.');
       }
+
+      const detectedSubnets = [...new Set(interfaces.map((item) => addressTo24(item.address)))];
+      if (detectedSubnets.length === 0) {
+        throw new Error('No private IPv4 network was detected.');
+      }
+      setSubnets(detectedSubnets);
+
+      const allResults = new Map<string, ScanResult>();
+      for (let index = 0; index < detectedSubnets.length; index += 1) {
+        const cidr = detectedSubnets[index];
+        setScanProgress(`Scanning ${cidr} (${index + 1}/${detectedSubnets.length})`);
+        const response = await fetch('/api/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cidr, ports: DEFAULT_PORTS }),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || `Could not scan ${cidr}.`);
+        }
+        for (const result of (data.results || []) as ScanResult[]) {
+          allResults.set(connectionKey(result.host, result.port), result);
+        }
+      }
+
+      setConnections((current) => {
+        const next = { ...current };
+        for (const [key, server] of allResults) {
+          next[key] = next[key] || createConnection(server);
+        }
+        return next;
+      });
+
+      const firstKey = allResults.keys().next().value as string | undefined;
+      if (firstKey) {
+        setSelectedKey((current) => current || firstKey);
+      } else {
+        setDiscoveryError('No FTP servers were found. You can add one manually.');
+      }
+      setScanProgress('');
+    } catch (error) {
+      setDiscoveryError(error instanceof Error ? error.message : 'Network discovery failed.');
+      setScanProgress('');
+    } finally {
+      setScanning(false);
     }
   }, []);
-  
-  // Connection parameters
-  const [credentials, setCredentials] = useState<{
-    host: string;
-    port: number;
-    username?: string;
-    password?: string;
-  } | null>(null);
 
-  // Prefilled credentials (when clicking 'Connect' in scanner)
-  const [initialHost, setInitialHost] = useState('');
-  const [initialPort, setInitialPort] = useState(2121); // Default common Android FTP port
+  useEffect(() => {
+    if (started.current) return;
+    started.current = true;
+    void scanNetworks();
+  }, [scanNetworks]);
 
-  // FTP Browser states
-  const [browserPath, setBrowserPath] = useState('/');
-  const [browserItems, setBrowserItems] = useState<FtpItem[]>([]);
-  const [browserLoading, setBrowserLoading] = useState(false);
-  const [browserError, setBrowserError] = useState<string | null>(null);
+  const connect = async (key: string) => {
+    const connection = connections[key];
+    if (!connection) return;
+    updateConnection(key, { status: 'connecting', loading: true, error: undefined });
 
-  // Triggered when clicking 'Connect' on a scanned results row
-  const handleSelectScannedServer = (host: string, port: number) => {
-    setInitialHost(host);
-    setInitialPort(port);
-    
-    // Smoothly scroll down to the manual credentials box
-    const manualEl = document.getElementById('manual-connection-container');
-    if (manualEl) {
-      manualEl.scrollIntoView({ behavior: 'smooth' });
+    const savedPath = readSavedPaths()[key] || connection.path || '/';
+    try {
+      const response = await fetch('/api/ftp/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          host: connection.server.host,
+          port: connection.server.port,
+          username: connection.anonymous ? 'anonymous' : connection.username,
+          password: connection.anonymous ? '' : connection.password,
+          path: savedPath,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Could not connect to the FTP server.');
+      }
+
+      updateConnection(key, {
+        status: 'connected',
+        loading: false,
+        error: undefined,
+        sessionId: data.sessionId,
+        path: data.path,
+        items: data.items || [],
+      });
+      savePath(key, data.path);
+      setSelectedKey(key);
+    } catch (error) {
+      updateConnection(key, {
+        status: 'error',
+        loading: false,
+        error: error instanceof Error ? error.message : 'Could not connect.',
+      });
     }
   };
 
-  // Directory listing fetcher
-  const fetchDirectory = async (
-    path: string,
-    currentCredentials = credentials
-  ) => {
-    if (!currentCredentials) return;
+  const disconnect = async (key: string) => {
+    const connection = connections[key];
+    if (connection?.sessionId) {
+      await fetch(`/api/ftp/session/${connection.sessionId}`, { method: 'DELETE' }).catch(() => undefined);
+    }
+    updateConnection(key, {
+      status: 'disconnected',
+      sessionId: undefined,
+      items: [],
+      loading: false,
+      error: undefined,
+      password: '',
+    });
+  };
 
-    setBrowserLoading(true);
-    setBrowserError(null);
+  const loadDirectory = async (key: string, path: string) => {
+    const connection = connections[key];
+    if (!connection?.sessionId) return;
+    updateConnection(key, { loading: true, error: undefined });
 
     try {
       const response = await fetch('/api/ftp/list', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          host: currentCredentials.host,
-          port: currentCredentials.port,
-          username: currentCredentials.username,
-          password: currentCredentials.password,
-          path,
-        }),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: connection.sessionId, path }),
       });
-
       const data = await response.json();
       if (!response.ok) {
-        throw new Error(data.error || 'Could not retrieve directory contents.');
+        if (data.code === 'SESSION_EXPIRED') {
+          updateConnection(key, { status: 'disconnected', sessionId: undefined, items: [] });
+        }
+        throw new Error(data.error || 'Could not open this folder.');
       }
 
-      setBrowserItems(data.items || []);
-      setBrowserPath(path);
-    } catch (err: any) {
-      setBrowserError(err.message || 'Error listing folder contents.');
-      // Keep old items if navigation failed
-    } finally {
-      setBrowserLoading(false);
+      updateConnection(key, {
+        path: data.path,
+        items: data.items as FtpItem[],
+        loading: false,
+      });
+      savePath(key, data.path);
+    } catch (error) {
+      updateConnection(key, {
+        loading: false,
+        error: error instanceof Error ? error.message : 'Could not open this folder.',
+      });
     }
   };
 
-  // Navigate to a directory and fetch its contents
-  const handleNavigate = (path: string) => {
-    setBrowserPath(path);
-    fetchDirectory(path);
+  const addManualConnection = (event: React.FormEvent) => {
+    event.preventDefault();
+    const host = manualHost.trim();
+    if (!host) return;
+    const key = connectionKey(host, manualPort);
+    const server: ScanResult = {
+      host,
+      port: manualPort,
+      status: 'open',
+      banner: 'Manual connection',
+      likelyFtp: true,
+    };
+    setConnections((current) => ({
+      ...current,
+      [key]: current[key] || createConnection(server),
+    }));
+    setSelectedKey(key);
+    setShowManual(false);
   };
 
-  // Perform initial login and root list
-  const handleConnect = async (creds: {
-    host: string;
-    port: number;
-    username?: string;
-    password?: string;
-  }) => {
-    setCredentials(creds);
-    setBrowserPath('/');
-    setBrowserItems([]);
-    await fetchDirectory('/', creds);
-  };
-
-  // Terminate local session
-  const handleDisconnect = () => {
-    setCredentials(null);
-    setBrowserItems([]);
-    setBrowserPath('/');
-    setBrowserError(null);
-  };
+  const connectionList = Object.values(connections);
+  const selected = selectedKey ? connections[selectedKey] : undefined;
 
   return (
-    <main className="min-h-screen bg-[#0F1115] text-[#E0E0E0] font-sans flex flex-col justify-between selection:bg-blue-600/30 selection:text-white">
-      {/* Professional Polish top header */}
-      <header className="flex items-center justify-between px-6 py-4 border-b border-[#2D333F] bg-[#161B22] shrink-0">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-blue-600 rounded flex items-center justify-center shadow-lg shadow-blue-900/20" id="app-logo">
-            <Network className="w-5 h-5 text-white" />
+    <main className="min-h-screen bg-[#0b0d10] text-slate-200">
+      <header className="border-b border-white/10 bg-[#101318]">
+        <div className="mx-auto flex max-w-[1600px] items-center justify-between px-5 py-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-md bg-blue-600">
+              <Network className="h-5 w-5 text-white" />
+            </div>
+            <div>
+              <h1 className="text-base font-semibold text-white">Local FTP</h1>
+              <p className="text-xs text-slate-500">
+                {scanProgress || `${connectionList.length} FTP server${connectionList.length === 1 ? '' : 's'} found`}
+              </p>
+            </div>
           </div>
-          <div>
-            <h1 className="text-xl font-semibold tracking-tight text-[#E0E0E0]">Local FTP Finder</h1>
-            <p className="text-[10px] text-gray-500 font-mono">
-              Safe private-subnet scanner & explorer
-            </p>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-4 text-xs font-mono text-gray-400">
-          <div className="flex items-center gap-2">
-            <span className={`w-2 h-2 rounded-full ${isCloud ? 'bg-amber-500' : 'bg-green-500 animate-pulse'}`}></span>
-            {isCloud ? 'Cloud Sandbox (Hosted)' : 'Local Service: Online'}
-          </div>
-          <div className="px-3 py-1 bg-[#21262D] rounded border border-[#30363D]">
-            {isCloud ? 'run.app' : '127.0.0.1:3000'}
-          </div>
+          <button
+            type="button"
+            onClick={() => void scanNetworks()}
+            disabled={scanning}
+            className="inline-flex items-center gap-2 rounded-md border border-white/10 px-3 py-2 text-xs font-medium text-slate-300 hover:bg-white/5 disabled:opacity-50"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${scanning ? 'animate-spin' : ''}`} />
+            Scan again
+          </button>
         </div>
       </header>
 
-      {/* Cloud Environment Warning Banner */}
-      {isCloud && (
-        <div className="max-w-7xl w-full mx-auto px-6 pt-6" id="cloud-environment-warning">
-          <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-5 flex flex-col md:flex-row md:items-start gap-4 shadow-sm">
-            <div className="p-2 bg-amber-500/10 rounded text-amber-400 shrink-0 self-start md:self-auto">
-              <Wifi className="w-5 h-5 animate-pulse" />
-            </div>
-            <div className="space-y-2 flex-1 animate-fade-in">
-              <h3 className="text-sm font-semibold text-amber-300">
-                ⚠️ Cloud Sandbox Connection Advisory
-              </h3>
-              <p className="text-xs text-amber-200/90 leading-relaxed">
-                You are currently viewing this application in the <strong>AI Studio Cloud Sandbox</strong>. 
-                Because the backend is hosted on a Google Cloud Run server, it cannot reach private IP addresses (such as your phone{"'"}s FTP server at <code className="bg-amber-950/40 px-1 py-0.5 rounded font-mono text-amber-300">192.168.0.246</code>) on your local home Wi-Fi network.
-              </p>
-              <div className="text-xs text-amber-300/90 bg-amber-950/20 border border-amber-500/20 rounded p-4 font-medium space-y-2">
-                <span className="block font-bold">To easily connect to your phone{"'"}s FTP server:</span>
-                <ol className="list-decimal pl-4 space-y-1.5">
-                  <li>Open the AI Studio workspace menu in the top right and click <strong>Export</strong> (either download the project as a ZIP or push to GitHub).</li>
-                  <li>Extract the ZIP and run the application on your local computer by executing the following terminal commands:
-                    <code className="block bg-[#0D1117]/80 p-2 mt-1.5 rounded text-gray-300 border border-[#30363D]/40 font-mono text-[11px] font-normal">npm install && npm run dev</code>
-                  </li>
-                  <li>Navigate to <code className="bg-amber-950/40 px-1.5 py-0.5 rounded font-mono text-amber-300">http://localhost:3000</code> in your browser. Since the server is now running on your local machine, it will be able to fully scan and browse files on your phone instantly!</li>
-                </ol>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      <div className="mx-auto grid max-w-[1600px] gap-5 px-5 py-6 lg:grid-cols-[340px_minmax(0,1fr)]">
+        <aside className="space-y-3">
+          {subnets.length > 0 && (
+            <p className="px-1 text-xs leading-5 text-slate-600">{subnets.join(' · ')}</p>
+          )}
 
-      {/* Main app body */}
-      <div className="flex-1 max-w-7xl w-full mx-auto px-6 py-8 space-y-8" id="main-content-layout">
-        
-        {/* Responsive Bento Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          
-          {/* Left Panel - Discovery & Credentials (5 Columns) */}
-          <div className="lg:col-span-5 space-y-6">
-            <NetworkSelector
-              onCidrChange={setSelectedCidr}
-              selectedCidr={selectedCidr}
+          {discoveryError && (
+            <p className="rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-xs leading-5 text-amber-200">
+              {discoveryError}
+            </p>
+          )}
+
+          {connectionList.map((connection) => (
+            <ConnectionCard
+              key={connection.key}
+              connection={connection}
+              selected={selectedKey === connection.key}
+              onSelect={() => setSelectedKey(connection.key)}
+              onLoginChange={(values: LoginValues) => updateConnection(connection.key, values)}
+              onConnect={() => void connect(connection.key)}
+              onDisconnect={() => void disconnect(connection.key)}
             />
+          ))}
 
-            <ScanPanel
-              cidr={selectedCidr}
-              onConnectServer={handleSelectScannedServer}
-            />
-
-            <ManualConnection
-              key={`${initialHost}:${initialPort}`}
-              initialHost={initialHost}
-              initialPort={initialPort}
-              onConnect={handleConnect}
-              loading={browserLoading && credentials === null}
-            />
-          </div>
-
-          {/* Right Panel - Active browser (7 Columns) */}
-          <div className="lg:col-span-7">
-            {credentials ? (
-              <div className="space-y-4 animate-fade-in" id="active-browser-wrapper">
-                {/* Connection Status Card */}
-                <div className="bg-[#161B22] border border-[#30363D] rounded-lg p-4 flex items-center justify-between gap-4 shadow-sm">
-                  <div className="flex items-center gap-3">
-                    <div className="w-9 h-9 rounded-full bg-blue-500/10 border border-blue-500/20 flex items-center justify-center shrink-0">
-                      <Wifi className="w-4 h-4 text-blue-400" />
-                    </div>
-                    <div>
-                      <div className="text-xs font-semibold text-[#E0E0E0]">
-                        Active Connection Established
-                      </div>
-                      <div className="text-xs text-gray-400 font-mono">
-                        Host: <span className="text-blue-400 font-medium">{credentials.host}</span>:{credentials.port} | User: <span className="text-gray-300">{credentials.username || 'anonymous'}</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={handleDisconnect}
-                    className="px-3 py-1.5 border border-[#30363D] hover:bg-[#21262D] text-xs font-medium rounded text-gray-300 hover:text-red-400 hover:border-red-900/50 transition-all flex items-center gap-1.5 shrink-0"
-                    id="disconnect-btn"
-                  >
-                    <Power className="w-3.5 h-3.5" />
-                    <span>Disconnect</span>
-                  </button>
-                </div>
-
-                <FileBrowser
-                  currentPath={browserPath}
-                  items={browserItems}
-                  loading={browserLoading}
-                  error={browserError}
-                  onNavigate={handleNavigate}
-                  onRefresh={() => fetchDirectory(browserPath)}
-                  credentials={credentials}
+          {showManual ? (
+            <form
+              onSubmit={addManualConnection}
+              className="space-y-3 rounded-lg border border-white/10 bg-[#11151b] p-4"
+            >
+              <div className="grid grid-cols-[1fr_90px] gap-2">
+                <input
+                  type="text"
+                  value={manualHost}
+                  onChange={(event) => setManualHost(event.target.value)}
+                  placeholder="192.168.1.20"
+                  required
+                  className="min-w-0 rounded-md border border-white/10 bg-[#0b0d10] px-3 py-2 text-sm outline-none focus:border-blue-500"
+                />
+                <input
+                  type="number"
+                  value={manualPort}
+                  onChange={(event) => setManualPort(Number(event.target.value))}
+                  min={1}
+                  max={65535}
+                  required
+                  className="rounded-md border border-white/10 bg-[#0b0d10] px-3 py-2 text-sm outline-none focus:border-blue-500"
                 />
               </div>
-            ) : (
-              <div className="bg-[#161B22] border border-[#30363D] border-dashed rounded-lg p-12 text-center h-full min-h-[420px] flex flex-col justify-center items-center gap-4 shadow-sm" id="inactive-browser-placeholder">
-                <div className="w-12 h-12 rounded-lg bg-[#0D1117] border border-[#30363D] flex items-center justify-center mb-1">
-                  <FolderTree className="w-6 h-6 text-gray-500" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-semibold text-[#E0E0E0]">File Explorer Inactive</h3>
-                  <p className="text-xs text-gray-400 max-w-sm mx-auto leading-relaxed mt-1">
-                    No active remote session. Select a detected FTP server from the Port Scanner above or input manual login parameters to browse.
-                  </p>
-                </div>
-                <div className="flex items-center gap-2 text-[10px] text-gray-500 font-mono uppercase bg-[#0D1117] border border-[#30363D] px-3 py-1.5 rounded-lg select-none">
-                  <CheckCircle className="w-3.5 h-3.5 text-blue-500" />
-                  <span>Stateless Session Ready</span>
-                </div>
+              <div className="flex gap-2">
+                <button className="flex-1 rounded-md bg-blue-600 px-3 py-2 text-xs font-medium text-white">
+                  Add server
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowManual(false)}
+                  className="rounded-md border border-white/10 px-3 py-2 text-xs text-slate-400"
+                >
+                  Cancel
+                </button>
               </div>
-            )}
-          </div>
+            </form>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setShowManual(true)}
+              className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-white/10 px-3 py-3 text-xs text-slate-500 hover:border-white/20 hover:text-slate-300"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              Add server manually
+            </button>
+          )}
+        </aside>
 
-        </div>
-
+        <section className="min-w-0">
+          {selected?.status === 'connected' && selected.sessionId ? (
+            <FileBrowser
+              key={selected.key}
+              sessionId={selected.sessionId}
+              currentPath={selected.path}
+              items={selected.items}
+              loading={selected.loading}
+              error={selected.error || null}
+              onNavigate={(path) => void loadDirectory(selected.key, path)}
+              onRefresh={() => void loadDirectory(selected.key, selected.path)}
+            />
+          ) : (
+            <div className="flex min-h-[560px] items-center justify-center rounded-lg border border-dashed border-white/10 bg-[#0e1116] p-8 text-center">
+              <div className="max-w-sm">
+                {selected ? (
+                  <Server className="mx-auto h-8 w-8 text-slate-700" />
+                ) : (
+                  <FolderSearch className="mx-auto h-8 w-8 text-slate-700" />
+                )}
+                <h2 className="mt-4 text-sm font-medium text-slate-300">
+                  {selected ? 'Connect to browse this server' : 'Select an FTP server'}
+                </h2>
+                <p className="mt-2 text-xs leading-5 text-slate-600">
+                  Files from the selected connected server will appear here.
+                </p>
+              </div>
+            </div>
+          )}
+        </section>
       </div>
-
-      {/* Professional Polish status footer */}
-      <footer className="px-6 py-2 bg-[#0D1117] border-t border-[#30363D] flex items-center justify-between text-[10px] text-gray-600 font-mono shrink-0">
-        <div>READY: Waiting for user action</div>
-        <div className="flex gap-4">
-          <span>CPU: 0.2%</span>
-          <span>RAM: 42MB</span>
-          <span>SCANNER: IDLE</span>
-        </div>
-      </footer>
     </main>
   );
+}
+
+function addressTo24(address: string): string {
+  const octets = address.split('.');
+  if (octets.length !== 4) throw new Error(`Unsupported network address: ${address}`);
+  return `${octets[0]}.${octets[1]}.${octets[2]}.0/24`;
+}
+
+function connectionKey(host: string, port: number) {
+  return `${host}:${port}`;
+}
+
+function createConnection(server: ScanResult): ConnectionEntry {
+  return {
+    key: connectionKey(server.host, server.port),
+    server,
+    status: 'disconnected',
+    path: '/',
+    items: [],
+    loading: false,
+    anonymous: true,
+    username: 'anonymous',
+    password: '',
+  };
+}
+
+function readSavedPaths(): Record<string, string> {
+  try {
+    return JSON.parse(localStorage.getItem(PATH_STORAGE_KEY) || '{}');
+  } catch {
+    return {};
+  }
+}
+
+function savePath(key: string, path: string) {
+  const paths = readSavedPaths();
+  paths[key] = path;
+  localStorage.setItem(PATH_STORAGE_KEY, JSON.stringify(paths));
 }

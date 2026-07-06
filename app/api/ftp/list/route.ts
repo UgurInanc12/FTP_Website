@@ -1,69 +1,49 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { ftpListRequestSchema } from '@/lib/validation';
 import { listFtpDirectory } from '@/lib/ftp';
-import { isCloudEnvironment, isLocalLanIp } from '@/lib/ip';
+import { normalizeFtpPath } from '@/lib/ftp-path';
+import { getFtpSession } from '@/lib/ftp-sessions';
+import { ftpSessionListRequestSchema } from '@/lib/validation';
+
+export const runtime = 'nodejs';
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
-
-    // Validate body
-    const parseResult = ftpListRequestSchema.safeParse(body);
-    if (!parseResult.success) {
+    const parsed = ftpSessionListRequestSchema.safeParse(await req.json());
+    if (!parsed.success) {
       return NextResponse.json(
-        { error: parseResult.error.issues[0]?.message || 'Invalid FTP connection request' },
+        { error: parsed.error.issues[0]?.message || 'Invalid directory request' },
         { status: 400 }
       );
     }
 
-    const { host, port, username, password, path } = parseResult.data;
+    const session = getFtpSession(parsed.data.sessionId);
+    if (!session) {
+      return NextResponse.json(
+        { error: 'FTP session expired. Connect again.', code: 'SESSION_EXPIRED' },
+        { status: 401 }
+      );
+    }
 
+    const path = normalizeFtpPath(parsed.data.path);
     const items = await listFtpDirectory(
-      {
-        host,
-        port,
-        username,
-        password,
-        timeoutMs: 6000, // 6 seconds connection timeout
-      },
+      { ...session.config, timeoutMs: 60000 },
       path
     );
-
-    return NextResponse.json({
-      path,
-      items,
-    });
-  } catch (error: any) {
-    // Return friendly readable errors for typical FTP network conditions
-    let errorMessage = error.message || 'Unknown FTP error';
-    
-    // Check if we are running in the cloud and connecting to a private LAN IP
-    const hostHeader = req.headers.get('host');
-    const isTargetLocal = req.body ? true : false; // We can parse the host from request data if validation succeeded
-    
-    // Fallback: extract host from body safely
-    let targetHost = '';
-    try {
-      const clonedReq = req.clone();
-      const body = await clonedReq.json();
-      targetHost = body.host || '';
-    } catch {
-      // Ignore
+    return NextResponse.json({ path, items });
+  } catch (error) {
+    const raw = error instanceof Error ? error.message : 'Could not list directory';
+    let message = raw;
+    let status = 500;
+    if (/invalid ftp path|path traversal/i.test(raw)) {
+      message = 'Invalid FTP path.';
+      status = 400;
+    } else if (/timeout/i.test(raw)) {
+      message = 'Directory listing timed out after 60 seconds.';
+      status = 504;
+    } else if (raw.includes('550') || /not found|no such/i.test(raw)) {
+      message = 'Folder not found or access denied.';
+      status = 404;
     }
-
-    if (targetHost && isLocalLanIp(targetHost) && isCloudEnvironment(hostHeader)) {
-      errorMessage = `Cloud Sandbox Limitation: You are accessing this application via Google Cloud. The cloud server cannot reach your phone's local network IP address (${targetHost}) because private addresses are not routable over the public internet. To connect successfully, please click the settings/export menu in the top right, download this project as a ZIP, and run it locally on your computer using 'npm install && npm run dev'.`;
-    } else if (errorMessage.includes('ETIMEDOUT') || errorMessage.includes('timeout')) {
-      errorMessage = 'Connection timed out. Ensure the FTP server is running and accessible on this port.';
-    } else if (errorMessage.includes('ECONNREFUSED')) {
-      errorMessage = 'Connection refused. Check host IP and Port.';
-    } else if (errorMessage.includes('530') || errorMessage.toLowerCase().includes('login failed')) {
-      errorMessage = 'Login failed. Invalid username or password.';
-    }
-
-    return NextResponse.json(
-      { error: errorMessage },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: message }, { status });
   }
 }

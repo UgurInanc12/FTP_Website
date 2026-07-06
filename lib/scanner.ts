@@ -58,6 +58,8 @@ export function scanHostPort(host: string, port: number, timeoutMs = 600): Promi
     socket.on('timeout', () => {
       cleanupAndResolve('closed', false, '');
     });
+
+    socket.connect(port, host);
   });
 }
 

@@ -1,6 +1,5 @@
 {
-  "name": "Local FTP Finder",
-  "description": "Scan your local network for FTP servers, browse directories, and download files from connected devices.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "name": "Local FTP",
+  "description": "Discover and browse FTP servers on the local network.",
+  "requestFramePermissions": []
 }

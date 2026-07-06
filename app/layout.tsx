@@ -1,9 +1,9 @@
 import type {Metadata} from 'next';
-import './globals.css'; // Global styles
+import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'My Google AI Studio App',
-  description: 'My Google AI Studio App',
+  title: 'Local FTP',
+  description: 'Discover, browse, and download files from FTP servers on your local network.',
 };
 
 export default function RootLayout({children}: {children: React.ReactNode}) {

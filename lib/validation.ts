@@ -41,3 +41,12 @@ export const ftpListRequestSchema = ftpCredentialsSchema.extend({
 export const ftpDownloadRequestSchema = ftpCredentialsSchema.extend({
   remotePath: z.string().min(1, 'Remote file path is required'),
 });
+
+export const ftpSessionRequestSchema = ftpCredentialsSchema.extend({
+  path: z.string().min(1).default('/'),
+});
+
+export const ftpSessionListRequestSchema = z.object({
+  sessionId: z.string().uuid(),
+  path: z.string().min(1, 'Directory path is required'),
+});

@@ -63,9 +63,9 @@ export async function GET() {
       results.push({
         name: 'Loopback',
         address: '127.0.0.1',
-        netmask: '255.0.0.0',
+        netmask: '255.255.255.255',
         family: 'IPv4',
-        cidr: '127.0.0.0/8',
+        cidr: '127.0.0.1/32',
       });
     }
 

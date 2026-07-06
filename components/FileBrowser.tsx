@@ -1,269 +1,352 @@
 'use client';
+/* eslint-disable @next/next/no-img-element */
 
-import React, { useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
+import {
+  ArrowLeft,
+  Download,
+  File,
+  FileAudio,
+  FileText,
+  Folder,
+  Image as ImageIcon,
+  Maximize2,
+  RefreshCw,
+  Video,
+} from 'lucide-react';
+import FilePreviewModal, {
+  createMediaUrl,
+  MediaKind,
+} from '@/components/FilePreviewModal';
 import { FtpItem } from '@/types/ftp';
-import { Folder, File, ArrowLeft, Download, RefreshCw, AlertTriangle, FileText } from 'lucide-react';
+
+type GridSize = 'compact' | 'standard' | 'large';
 
 interface FileBrowserProps {
+  sessionId: string;
   currentPath: string;
   items: FtpItem[];
   loading: boolean;
   error: string | null;
   onNavigate: (newPath: string) => void;
   onRefresh: () => void;
-  credentials: {
-    host: string;
-    port: number;
-    username?: string;
-    password?: string;
-  } | null;
 }
 
+const GRID_STORAGE_KEY = 'local-ftp:grid-size:v1';
+const GRID_CONFIG: Record<GridSize, { minWidth: number; previewHeight: number; rowHeight: number; width: number }> = {
+  compact: { minWidth: 130, previewHeight: 92, rowHeight: 174, width: 160 },
+  standard: { minWidth: 190, previewHeight: 136, rowHeight: 226, width: 240 },
+  large: { minWidth: 270, previewHeight: 190, rowHeight: 288, width: 360 },
+};
+
 export default function FileBrowser({
+  sessionId,
   currentPath,
   items,
   loading,
   error,
   onNavigate,
   onRefresh,
-  credentials,
 }: FileBrowserProps) {
-  const [downloadingFile, setDownloadingFile] = useState<string | null>(null);
-  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [contentWidth, setContentWidth] = useState(800);
+  const [gridSize, setGridSize] = useState<GridSize>('standard');
+  const [gridPreferenceReady, setGridPreferenceReady] = useState(false);
+  const [previewItem, setPreviewItem] = useState<FtpItem | null>(null);
 
-  if (!credentials) {
-    return null;
-  }
+  const sortedItems = useMemo(
+    () => [
+      ...items.filter((item) => item.type === 'directory'),
+      ...items.filter((item) => item.type !== 'directory'),
+    ],
+    [items]
+  );
 
-  // Format file size nicely
-  const formatSize = (bytes: number) => {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
-  };
+  const config = GRID_CONFIG[gridSize];
+  const gap = 12;
+  const columns = Math.max(1, Math.floor((contentWidth + gap) / (config.minWidth + gap)));
+  const rowCount = Math.ceil(sortedItems.length / columns);
+  // TanStack Virtual intentionally exposes mutable measurement functions.
+  // eslint-disable-next-line react-hooks/incompatible-library
+  const rowVirtualizer = useVirtualizer({
+    count: rowCount,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => config.rowHeight + gap,
+    overscan: 3,
+  });
 
-  // Traverse to a child directory or parent directory
-  const handleFolderClick = (folderName: string) => {
-    let newPath = currentPath;
-    if (newPath.endsWith('/')) {
-      newPath += folderName;
-    } else {
-      newPath += '/' + folderName;
+  useEffect(() => {
+    const element = contentRef.current;
+    if (!element) return;
+    const observer = new ResizeObserver(([entry]) => setContentWidth(entry.contentRect.width));
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const saved = localStorage.getItem(GRID_STORAGE_KEY);
+    if (saved === 'compact' || saved === 'standard' || saved === 'large') {
+      setGridSize(saved);
     }
-    onNavigate(newPath);
+    setGridPreferenceReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!gridPreferenceReady) return;
+    localStorage.setItem(GRID_STORAGE_KEY, gridSize);
+    rowVirtualizer.measure();
+  }, [gridPreferenceReady, gridSize, rowVirtualizer]);
+
+  const navigateToChild = (name: string) => {
+    const encodedPath = currentPath === '/' ? `/${name}` : `${currentPath}/${name}`;
+    onNavigate(encodedPath);
   };
 
-  const handleParentClick = () => {
-    if (currentPath === '/') return;
+  const navigateToParent = () => {
     const segments = currentPath.split('/').filter(Boolean);
     segments.pop();
-    const newPath = '/' + segments.join('/');
-    onNavigate(newPath);
-  };
-
-  // Download a remote file
-  const handleDownload = async (item: FtpItem) => {
-    const fullRemotePath = currentPath.endsWith('/')
-      ? `${currentPath}${item.name}`
-      : `${currentPath}/${item.name}`;
-
-    setDownloadingFile(item.name);
-    setDownloadError(null);
-
-    try {
-      const response = await fetch('/api/ftp/download', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          host: credentials.host,
-          port: credentials.port,
-          username: credentials.username,
-          password: credentials.password,
-          remotePath: fullRemotePath,
-        }),
-      });
-
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Could not download file.');
-      }
-
-      // Convert the response to a Blob stream and trigger a client-side download
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.setAttribute('download', item.name);
-      document.body.appendChild(link);
-      link.click();
-      
-      // Cleanup
-      link.parentNode?.removeChild(link);
-      window.URL.revokeObjectURL(url);
-    } catch (err: any) {
-      setDownloadError(`Could not download file: ${err.message}`);
-    } finally {
-      setDownloadingFile(null);
-    }
+    onNavigate(`/${segments.join('/')}`);
   };
 
   return (
-    <div className="bg-[#161B22] rounded-lg border border-[#30363D] flex flex-col overflow-hidden shadow-sm" id="file-browser-container">
-      {/* Header bar */}
-      <div className="p-4 border-b border-[#30363D] bg-[#1C2128] flex flex-col sm:flex-row sm:items-center justify-between gap-3" id="file-browser-header">
-        <div className="space-y-1">
-          <h2 className="text-xs font-bold text-gray-500 uppercase tracking-widest">FTP File Browser</h2>
-          <div className="flex items-center gap-1.5 bg-[#0D1117] px-3 py-1.5 rounded border border-[#30363D] text-xs font-mono text-[#E0E0E0]" id="current-path-display">
-            <span className="text-blue-400 font-semibold select-none">Path:</span>
-            <span className="truncate">{currentPath}</span>
+    <>
+      <div className="flex h-[calc(100vh-116px)] min-h-[560px] flex-col overflow-hidden rounded-lg border border-white/10 bg-[#11151b]">
+        <header className="flex flex-col justify-between gap-3 border-b border-white/10 bg-[#141920] p-4 xl:flex-row xl:items-center">
+          <div className="min-w-0">
+            <h2 className="text-sm font-medium text-white">Files</h2>
+            <p className="mt-1 truncate text-xs text-slate-500">
+              {currentPath} · {items.length.toLocaleString()} items
+            </p>
           </div>
-        </div>
-
-        <div className="flex gap-2 shrink-0">
-          {currentPath !== '/' && (
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex rounded-md border border-white/10 p-0.5">
+              {(['compact', 'standard', 'large'] as GridSize[]).map((size) => (
+                <button
+                  key={size}
+                  type="button"
+                  onClick={() => setGridSize(size)}
+                  className={`rounded px-2.5 py-1.5 text-xs capitalize ${
+                    gridSize === size ? 'bg-white/10 text-white' : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                  {size}
+                </button>
+              ))}
+            </div>
+            {currentPath !== '/' && (
+              <button
+                type="button"
+                onClick={navigateToParent}
+                className="inline-flex items-center gap-1.5 rounded-md border border-white/10 px-3 py-2 text-xs text-slate-300 hover:bg-white/5"
+              >
+                <ArrowLeft className="h-3.5 w-3.5" />
+                Parent
+              </button>
+            )}
             <button
               type="button"
-              onClick={handleParentClick}
-              className="px-3 py-1.5 text-xs border border-[#30363D] rounded hover:bg-[#21262D] text-gray-300 font-medium transition-colors inline-flex items-center gap-1"
-              id="navigate-parent-btn"
+              onClick={onRefresh}
+              disabled={loading}
+              className="inline-flex items-center gap-1.5 rounded-md border border-white/10 px-3 py-2 text-xs text-slate-300 hover:bg-white/5 disabled:opacity-50"
             >
-              <ArrowLeft className="w-3.5 h-3.5" />
-              Parent Folder
+              <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+              Refresh
             </button>
+          </div>
+        </header>
+
+        {error && (
+          <p className="m-3 rounded-md border border-red-400/20 bg-red-400/5 p-3 text-xs text-red-200">
+            {error}
+          </p>
+        )}
+
+        <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto">
+          {loading && items.length === 0 ? (
+            <div className="flex h-full items-center justify-center gap-2 text-sm text-slate-500">
+              <RefreshCw className="h-4 w-4 animate-spin" />
+              Loading files
+            </div>
+          ) : sortedItems.length === 0 ? (
+            <div className="flex h-full items-center justify-center text-sm text-slate-600">Empty folder</div>
+          ) : (
+            <div ref={contentRef} className="relative m-3" style={{ height: rowVirtualizer.getTotalSize() }}>
+              {rowVirtualizer.getVirtualItems().map((virtualRow) => {
+                const rowItems = sortedItems.slice(
+                  virtualRow.index * columns,
+                  virtualRow.index * columns + columns
+                );
+                return (
+                  <div
+                    key={virtualRow.key}
+                    className="absolute left-0 top-0 grid w-full gap-3"
+                    style={{
+                      height: config.rowHeight,
+                      transform: `translateY(${virtualRow.start}px)`,
+                      gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
+                    }}
+                  >
+                    {rowItems.map((item) => {
+                      const remotePath = joinRemotePath(currentPath, item.name);
+                      const kind = getMediaKind(item.name);
+                      return (
+                        <FileCard
+                          key={item.name}
+                          item={item}
+                          kind={kind}
+                          sessionId={sessionId}
+                          remotePath={remotePath}
+                          previewHeight={config.previewHeight}
+                          thumbnailWidth={config.width}
+                          onOpen={() =>
+                            item.type === 'directory'
+                              ? navigateToChild(item.name)
+                              : setPreviewItem(item)
+                          }
+                        />
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
           )}
-          <button
-            type="button"
-            disabled={loading}
-            onClick={onRefresh}
-            className="px-3 py-1.5 text-xs bg-gray-750 hover:bg-gray-700 text-[#E0E0E0] rounded transition-colors disabled:opacity-50 inline-flex items-center gap-1 border border-[#30363D]"
-            id="refresh-directory-btn"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-blue-500' : ''}`} />
-            Refresh
-          </button>
         </div>
       </div>
 
-      {/* Download error display */}
-      {downloadError && (
-        <div className="m-4 p-3 bg-red-950/40 border border-red-900/50 rounded text-red-400 text-xs flex items-start gap-2" id="download-error-box">
-          <AlertTriangle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
-          <span>{downloadError}</span>
-        </div>
+      {previewItem && (
+        <FilePreviewModal
+          item={previewItem}
+          remotePath={joinRemotePath(currentPath, previewItem.name)}
+          sessionId={sessionId}
+          kind={getMediaKind(previewItem.name)}
+          onClose={() => setPreviewItem(null)}
+        />
       )}
-
-      {/* Directory Contents */}
-      {loading ? (
-        <div className="py-12 flex flex-col justify-center items-center gap-2 text-gray-400 text-xs font-medium" id="browser-loading-spinner">
-          <RefreshCw className="w-5 h-5 animate-spin text-blue-500" />
-          <span>Loading files...</span>
-        </div>
-      ) : error ? (
-        <div className="py-10 text-center bg-[#0D1117] border border-[#30363D] rounded m-4 space-y-2 px-4" id="browser-error-box">
-          <AlertTriangle className="w-6 h-6 text-red-500 mx-auto" />
-          <h4 className="text-xs font-semibold text-gray-300">Could not list directory</h4>
-          <p className="text-[11px] text-gray-500 max-w-sm mx-auto leading-relaxed">{error}</p>
-        </div>
-      ) : items.length === 0 ? (
-        <div className="py-12 text-center bg-[#0D1117] border border-[#30363D] rounded m-4 text-xs text-gray-500" id="browser-empty-box">
-          Empty directory
-        </div>
-      ) : (
-        <div className="overflow-x-auto bg-[#0D1117]" id="files-table-container">
-          <table className="w-full text-left border-collapse">
-            <thead>
-              <tr className="sticky top-0 bg-[#161B22] text-[11px] text-gray-500 uppercase tracking-widest border-b border-[#30363D]">
-                <th className="px-4 py-3 font-semibold">Name</th>
-                <th className="px-4 py-3 font-semibold">Type</th>
-                <th className="px-4 py-3 font-semibold text-right">Size</th>
-                <th className="px-4 py-3 font-semibold text-right">Action</th>
-              </tr>
-            </thead>
-            <tbody className="text-sm font-mono text-[#E0E0E0]">
-              {items.map((item) => (
-                <tr key={item.name} className="border-b border-[#21262D] hover:bg-[#21262D]/50 transition-colors group">
-                  <td className="px-4 py-3 max-w-[280px] truncate flex items-center gap-2">
-                    {item.type === 'directory' ? (
-                      <button
-                        type="button"
-                        onClick={() => handleFolderClick(item.name)}
-                        className="flex items-center gap-2 text-blue-400 hover:text-blue-300 hover:underline font-medium text-left"
-                        id={`folder-link-${item.name.toLowerCase()}`}
-                      >
-                        <Folder className="w-4 h-4 shrink-0 text-blue-500 fill-blue-500/10" />
-                        <span>{item.name}</span>
-                      </button>
-                    ) : (
-                      <span className="flex items-center gap-2 text-gray-300">
-                        {item.name.endsWith('.txt') || item.name.endsWith('.log') ? (
-                          <FileText className="w-4 h-4 shrink-0 text-gray-500" />
-                        ) : (
-                          <File className="w-4 h-4 shrink-0 text-gray-500" />
-                        )}
-                        <span>{item.name}</span>
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-4 py-3 text-[11px] text-gray-500 select-none">
-                    {item.type === 'directory' ? 'DIR' : 'FILE'}
-                  </td>
-                  <td className="px-4 py-3 text-right text-[11px] text-gray-400">
-                    {item.type === 'file' ? formatSize(item.size) : '—'}
-                  </td>
-                  <td className="px-4 py-3 text-right font-sans">
-                    {item.type === 'file' ? (
-                      <button
-                        type="button"
-                        disabled={downloadingFile !== null}
-                        onClick={() => handleDownload(item)}
-                        className="px-2 py-1 text-xs bg-blue-600/10 text-blue-400 border border-blue-600/30 rounded hover:bg-blue-600/20 inline-flex items-center gap-1 transition-colors disabled:opacity-50 ml-auto cursor-pointer"
-                        id={`download-file-${item.name.toLowerCase()}`}
-                      >
-                        {downloadingFile === item.name ? (
-                          <>
-                            <RefreshCw className="w-3 h-3 animate-spin text-blue-500" />
-                            <span>Downloading...</span>
-                          </>
-                        ) : (
-                          <>
-                            <Download className="w-3 h-3" />
-                            <span>Download</span>
-                          </>
-                        )}
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => handleFolderClick(item.name)}
-                        className="text-xs text-blue-400 hover:underline font-medium"
-                        id={`open-folder-${item.name.toLowerCase()}`}
-                      >
-                        Open
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {/* Table bottom summary */}
-      {!loading && !error && items.length > 0 && (
-        <div className="p-3 bg-[#0D1117] border-t border-[#30363D] flex items-center justify-between">
-          <div className="text-[11px] text-gray-500 font-mono">
-            {items.length} item{items.length > 1 ? 's' : ''} total &bull; Path: {currentPath}
-          </div>
-          <div className="text-[10px] uppercase tracking-widest text-orange-500/85 font-semibold hidden sm:block">
-            Only scan networks you have permission to access.
-          </div>
-        </div>
-      )}
-    </div>
+    </>
   );
+}
+
+function FileCard({
+  item,
+  kind,
+  sessionId,
+  remotePath,
+  previewHeight,
+  thumbnailWidth,
+  onOpen,
+}: {
+  item: FtpItem;
+  kind: MediaKind;
+  sessionId: string;
+  remotePath: string;
+  previewHeight: number;
+  thumbnailWidth: number;
+  onOpen: () => void;
+}) {
+  const [previewFailed, setPreviewFailed] = useState(false);
+  const mediaUrl = createMediaUrl(sessionId, remotePath);
+  const thumbnailParams = new URLSearchParams({
+    path: remotePath,
+    modifiedAt: item.modifiedAt,
+    width: String(thumbnailWidth),
+  });
+  const thumbnailUrl = `/api/ftp/thumbnail/${sessionId}?${thumbnailParams.toString()}`;
+
+  return (
+    <article className="group flex min-w-0 flex-col overflow-hidden rounded-lg border border-white/10 bg-[#0d1015] hover:border-white/20">
+      <button
+        type="button"
+        onClick={onOpen}
+        className="relative flex w-full items-center justify-center overflow-hidden bg-black/20 text-left"
+        style={{ height: previewHeight }}
+        title={item.name}
+      >
+        {item.type === 'directory' ? (
+          <Folder className="h-10 w-10 fill-blue-500/10 text-blue-400" />
+        ) : kind === 'image' && !previewFailed ? (
+          <img
+            src={thumbnailUrl}
+            alt=""
+            loading="lazy"
+            onError={() => setPreviewFailed(true)}
+            className="h-full w-full object-cover"
+          />
+        ) : kind === 'video' && !previewFailed ? (
+          <video
+            src={mediaUrl}
+            muted
+            playsInline
+            preload="metadata"
+            onLoadedMetadata={(event) => {
+              try {
+                event.currentTarget.currentTime = Math.min(0.1, event.currentTarget.duration || 0.1);
+              } catch {
+                setPreviewFailed(true);
+              }
+            }}
+            onError={() => setPreviewFailed(true)}
+            className="h-full w-full object-cover"
+          />
+        ) : (
+          <FileKindIcon kind={kind} />
+        )}
+        {item.type !== 'directory' && (
+          <span className="absolute right-2 top-2 rounded bg-black/60 p-1 text-white opacity-0 transition-opacity group-hover:opacity-100">
+            <Maximize2 className="h-3.5 w-3.5" />
+          </span>
+        )}
+      </button>
+
+      <div className="min-w-0 flex-1 p-2.5">
+        <p className="truncate text-xs font-medium text-slate-200" title={item.name}>
+          {item.name}
+        </p>
+        <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-slate-600">
+          <span>{item.type === 'directory' ? 'Folder' : formatSize(item.size)}</span>
+          {item.type !== 'directory' && (
+            <a
+              href={`${mediaUrl}&download=1`}
+              onClick={(event) => event.stopPropagation()}
+              aria-label={`Download ${item.name}`}
+              className="rounded p-1 text-slate-500 hover:bg-white/5 hover:text-blue-300"
+            >
+              <Download className="h-3.5 w-3.5" />
+            </a>
+          )}
+        </div>
+      </div>
+    </article>
+  );
+}
+
+function FileKindIcon({ kind }: { kind: MediaKind }) {
+  if (kind === 'image') return <ImageIcon className="h-9 w-9 text-slate-600" />;
+  if (kind === 'video') return <Video className="h-9 w-9 text-slate-600" />;
+  if (kind === 'audio') return <FileAudio className="h-9 w-9 text-slate-600" />;
+  if (kind === 'text' || kind === 'pdf') return <FileText className="h-9 w-9 text-slate-600" />;
+  return <File className="h-9 w-9 text-slate-600" />;
+}
+
+function joinRemotePath(parent: string, name: string) {
+  return parent === '/' ? `/${name}` : `${parent}/${name}`;
+}
+
+function getMediaKind(filename: string): MediaKind {
+  const extension = filename.split('.').pop()?.toLowerCase() || '';
+  if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'heic', 'heif', 'svg'].includes(extension)) return 'image';
+  if (['mp4', 'm4v', 'mov', 'webm', 'mkv', 'avi'].includes(extension)) return 'video';
+  if (['mp3', 'm4a', 'aac', 'wav', 'ogg', 'flac'].includes(extension)) return 'audio';
+  if (extension === 'pdf') return 'pdf';
+  if (['txt', 'log', 'md', 'json', 'csv', 'xml', 'js', 'ts', 'css', 'html'].includes(extension)) return 'text';
+  return 'other';
+}
+
+function formatSize(bytes: number) {
+  if (bytes === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }

@@ -20,3 +20,6 @@ Open [http://localhost:3000](http://localhost:3000). Discovery starts automatica
 The app scans every detected private adapter as a bounded `/24`. Select a discovered server, choose anonymous access or enter credentials, and click Connect. Credentials remain in server memory only and expire after one hour.
 
 Image thumbnails are cached under `.cache/ftp-thumbnails` and automatically limited to 512 MB.
+Video cards capture a maximum 360p poster with at most two simultaneous preview streams; opening a file still uses the original full-quality media.
+
+The file grid supports newest, oldest, name, and size sorting. FTP does not expose creation time, so date sorting uses modification metadata or camera timestamps embedded in filenames when necessary.

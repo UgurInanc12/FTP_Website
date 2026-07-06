@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { promises as fs } from 'fs';
 import path from 'path';
+import type { Readable } from 'stream';
 import { NextRequest, NextResponse } from 'next/server';
 import sharp from 'sharp';
 import { streamFtpDownload } from '@/lib/ftp';
@@ -48,12 +49,7 @@ export async function GET(
       { ...session.config, timeoutMs: 60000 },
       remotePath
     );
-    const transformer = sharp()
-      .rotate()
-      .resize({ width, height: Math.round(width * 0.75), fit: 'cover', withoutEnlargement: true })
-      .webp({ quality: 76 });
-    source.pipe(transformer);
-    const thumbnail = await transformer.toBuffer();
+    const thumbnail = await createImageThumbnail(source, width);
 
     await fs.writeFile(cachedPath, thumbnail);
     void trimCache();
@@ -62,6 +58,23 @@ export async function GET(
     const message = error instanceof Error ? error.message : 'Could not create thumbnail';
     return NextResponse.json({ error: message }, { status: 422 });
   }
+}
+
+async function createImageThumbnail(
+  source: Readable,
+  width: number
+): Promise<Buffer> {
+  const transformer = sharp()
+    .rotate()
+    .resize({
+      width,
+      height: Math.min(360, Math.round(width * 0.75)),
+      fit: 'cover',
+      withoutEnlargement: true,
+    })
+    .webp({ quality: 72 });
+  source.pipe(transformer);
+  return transformer.toBuffer();
 }
 
 function thumbnailResponse(data: Buffer, cacheControl: string) {

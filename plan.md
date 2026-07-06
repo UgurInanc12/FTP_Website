@@ -24,7 +24,10 @@ On every refresh, detect and scan all private PC network adapters as bounded `/2
 
 - Render directories first in a responsive virtualized grid suitable for thousands of files.
 - Provide persistent Compact, Standard, and Large grid sizes.
+- Provide persistent server-order, newest, oldest, name, and size sorting; creation dates are not claimed because FTP does not expose them.
 - Lazy-load cached image thumbnails and browser-native video frames only for visible cards.
+- Limit video poster extraction to two concurrent streams and capture each card poster as a maximum 640×360 WebP; fullscreen preview remains full quality.
+- Support per-folder multi-selection with Select all and Unselect all without changing selection when a file preview opens.
 - Preview images, video, audio, PDF, and safe text files in an accessible modal.
 - Keep unsupported files download-only and stream large downloads without browser blob buffering.
 

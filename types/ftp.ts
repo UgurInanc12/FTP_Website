@@ -2,7 +2,7 @@ export interface FtpItem {
   name: string;
   type: 'directory' | 'file' | 'link';
   size: number;
-  modifiedAt: string;
+  modifiedAt: string | null;
 }
 
 export interface FtpListResponse {

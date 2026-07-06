@@ -22,6 +22,7 @@ import FilePreviewModal, {
 import { FtpItem } from '@/types/ftp';
 
 type GridSize = 'compact' | 'standard' | 'large';
+type SortOrder = 'default' | 'newest' | 'oldest' | 'name-asc' | 'name-desc' | 'size-desc' | 'size-asc';
 
 interface FileBrowserProps {
   sessionId: string;
@@ -34,10 +35,14 @@ interface FileBrowserProps {
 }
 
 const GRID_STORAGE_KEY = 'local-ftp:grid-size:v1';
+const SORT_STORAGE_KEY = 'local-ftp:sort-order:v1';
+const MAX_VIDEO_PREVIEWS = 2;
+let activeVideoPreviews = 0;
+const videoPreviewQueue: Array<(release: () => void) => void> = [];
 const GRID_CONFIG: Record<GridSize, { minWidth: number; previewHeight: number; rowHeight: number; width: number }> = {
-  compact: { minWidth: 130, previewHeight: 92, rowHeight: 174, width: 160 },
-  standard: { minWidth: 190, previewHeight: 136, rowHeight: 226, width: 240 },
-  large: { minWidth: 270, previewHeight: 190, rowHeight: 288, width: 360 },
+  compact: { minWidth: 130, previewHeight: 92, rowHeight: 190, width: 160 },
+  standard: { minWidth: 190, previewHeight: 136, rowHeight: 242, width: 240 },
+  large: { minWidth: 270, previewHeight: 190, rowHeight: 304, width: 360 },
 };
 
 export default function FileBrowser({
@@ -54,14 +59,19 @@ export default function FileBrowser({
   const [contentWidth, setContentWidth] = useState(800);
   const [gridSize, setGridSize] = useState<GridSize>('standard');
   const [gridPreferenceReady, setGridPreferenceReady] = useState(false);
+  const [sortOrder, setSortOrder] = useState<SortOrder>('default');
+  const [sortPreferenceReady, setSortPreferenceReady] = useState(false);
   const [previewItem, setPreviewItem] = useState<FtpItem | null>(null);
+  const [selectedNames, setSelectedNames] = useState<Set<string>>(() => new Set());
 
-  const sortedItems = useMemo(
-    () => [
-      ...items.filter((item) => item.type === 'directory'),
-      ...items.filter((item) => item.type !== 'directory'),
-    ],
-    [items]
+  const sortedItems = useMemo(() => {
+    const directories = items.filter((item) => item.type === 'directory');
+    const files = items.filter((item) => item.type !== 'directory');
+    return [...sortItems(directories, sortOrder), ...sortItems(files, sortOrder)];
+  }, [items, sortOrder]);
+  const selectedCount = items.reduce(
+    (count, item) => count + (selectedNames.has(item.name) ? 1 : 0),
+    0
   );
 
   const config = GRID_CONFIG[gridSize];
@@ -99,12 +109,26 @@ export default function FileBrowser({
     rowVirtualizer.measure();
   }, [gridPreferenceReady, gridSize, rowVirtualizer]);
 
+  useEffect(() => {
+    const saved = localStorage.getItem(SORT_STORAGE_KEY);
+    if (isSortOrder(saved)) setSortOrder(saved);
+    setSortPreferenceReady(true);
+  }, []);
+
+  useEffect(() => {
+    if (!sortPreferenceReady) return;
+    localStorage.setItem(SORT_STORAGE_KEY, sortOrder);
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [sortOrder, sortPreferenceReady]);
+
   const navigateToChild = (name: string) => {
+    setSelectedNames(new Set());
     const encodedPath = currentPath === '/' ? `/${name}` : `${currentPath}/${name}`;
     onNavigate(encodedPath);
   };
 
   const navigateToParent = () => {
+    setSelectedNames(new Set());
     const segments = currentPath.split('/').filter(Boolean);
     segments.pop();
     onNavigate(`/${segments.join('/')}`);
@@ -121,6 +145,42 @@ export default function FileBrowser({
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-slate-500">
+              {selectedCount} selected
+            </span>
+            <button
+              type="button"
+              onClick={() => setSelectedNames(new Set(items.map((item) => item.name)))}
+              disabled={items.length === 0 || selectedCount === items.length}
+              className="rounded-md border border-white/10 px-2.5 py-1.5 text-xs text-slate-300 hover:bg-white/5 disabled:opacity-40"
+            >
+              Select all
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedNames(new Set())}
+              disabled={selectedCount === 0}
+              className="rounded-md border border-white/10 px-2.5 py-1.5 text-xs text-slate-300 hover:bg-white/5 disabled:opacity-40"
+            >
+              Unselect all
+            </button>
+            <label className="flex items-center gap-2 rounded-md border border-white/10 px-2.5 py-1.5 text-xs text-slate-500">
+              <span>Sort</span>
+              <select
+                value={sortOrder}
+                onChange={(event) => setSortOrder(event.target.value as SortOrder)}
+                className="rounded bg-[#11151b] px-1 py-0.5 text-slate-200 outline-none"
+                title="FTP does not expose creation dates. Newest and oldest use modification metadata or a timestamp in the filename."
+              >
+                <option value="default">Server order</option>
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="name-asc">Name A–Z</option>
+                <option value="name-desc">Name Z–A</option>
+                <option value="size-desc">Largest first</option>
+                <option value="size-asc">Smallest first</option>
+              </select>
+            </label>
             <div className="flex rounded-md border border-white/10 p-0.5">
               {(['compact', 'standard', 'large'] as GridSize[]).map((size) => (
                 <button
@@ -163,7 +223,15 @@ export default function FileBrowser({
           </p>
         )}
 
-        <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto">
+        <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-auto">
+          {loading && items.length > 0 && (
+            <div className="absolute inset-0 z-30 flex items-center justify-center bg-[#0b0d10]/75 backdrop-blur-[1px]">
+              <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-[#11151b] px-4 py-3 text-sm text-slate-300 shadow-xl">
+                <RefreshCw className="h-4 w-4 animate-spin text-blue-400" />
+                Opening folder…
+              </div>
+            </div>
+          )}
           {loading && items.length === 0 ? (
             <div className="flex h-full items-center justify-center gap-2 text-sm text-slate-500">
               <RefreshCw className="h-4 w-4 animate-spin" />
@@ -200,6 +268,15 @@ export default function FileBrowser({
                           remotePath={remotePath}
                           previewHeight={config.previewHeight}
                           thumbnailWidth={config.width}
+                          selected={selectedNames.has(item.name)}
+                          onToggleSelected={() =>
+                            setSelectedNames((current) => {
+                              const next = new Set(current);
+                              if (next.has(item.name)) next.delete(item.name);
+                              else next.add(item.name);
+                              return next;
+                            })
+                          }
                           onOpen={() =>
                             item.type === 'directory'
                               ? navigateToChild(item.name)
@@ -236,6 +313,8 @@ function FileCard({
   remotePath,
   previewHeight,
   thumbnailWidth,
+  selected,
+  onToggleSelected,
   onOpen,
 }: {
   item: FtpItem;
@@ -244,19 +323,38 @@ function FileCard({
   remotePath: string;
   previewHeight: number;
   thumbnailWidth: number;
+  selected: boolean;
+  onToggleSelected: () => void;
   onOpen: () => void;
 }) {
   const [previewFailed, setPreviewFailed] = useState(false);
   const mediaUrl = createMediaUrl(sessionId, remotePath);
   const thumbnailParams = new URLSearchParams({
     path: remotePath,
-    modifiedAt: item.modifiedAt,
+    modifiedAt: item.modifiedAt || '',
     width: String(thumbnailWidth),
   });
   const thumbnailUrl = `/api/ftp/thumbnail/${sessionId}?${thumbnailParams.toString()}`;
 
   return (
-    <article className="group flex min-w-0 flex-col overflow-hidden rounded-lg border border-white/10 bg-[#0d1015] hover:border-white/20">
+    <article
+      className={`group relative flex min-w-0 flex-col overflow-hidden rounded-lg border bg-[#0d1015] ${
+        selected ? 'border-blue-500 ring-1 ring-blue-500/30' : 'border-white/10 hover:border-white/20'
+      }`}
+    >
+      <label
+        className="absolute left-2 top-2 z-20 flex h-6 w-6 cursor-pointer items-center justify-center rounded bg-black/70"
+        onClick={(event) => event.stopPropagation()}
+        title={selected ? `Unselect ${item.name}` : `Select ${item.name}`}
+      >
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={onToggleSelected}
+          aria-label={selected ? `Unselect ${item.name}` : `Select ${item.name}`}
+          className="h-4 w-4 cursor-pointer accent-blue-600"
+        />
+      </label>
       <button
         type="button"
         onClick={onOpen}
@@ -275,20 +373,10 @@ function FileCard({
             className="h-full w-full object-cover"
           />
         ) : kind === 'video' && !previewFailed ? (
-          <video
-            src={mediaUrl}
-            muted
-            playsInline
-            preload="metadata"
-            onLoadedMetadata={(event) => {
-              try {
-                event.currentTarget.currentTime = Math.min(0.1, event.currentTarget.duration || 0.1);
-              } catch {
-                setPreviewFailed(true);
-              }
-            }}
+          <VideoThumbnail
+            mediaUrl={mediaUrl}
+            name={item.name}
             onError={() => setPreviewFailed(true)}
-            className="h-full w-full object-cover"
           />
         ) : (
           <FileKindIcon kind={kind} />
@@ -303,6 +391,9 @@ function FileCard({
       <div className="min-w-0 flex-1 p-2.5">
         <p className="truncate text-xs font-medium text-slate-200" title={item.name}>
           {item.name}
+        </p>
+        <p className="mt-1 truncate text-[10px] text-slate-600">
+          {item.modifiedAt ? formatDate(item.modifiedAt) : 'Date unavailable'}
         </p>
         <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-slate-600">
           <span>{item.type === 'directory' ? 'Folder' : formatSize(item.size)}</span>
@@ -319,6 +410,121 @@ function FileCard({
         </div>
       </div>
     </article>
+  );
+}
+
+function VideoThumbnail({
+  mediaUrl,
+  name,
+  onError,
+}: {
+  mediaUrl: string;
+  name: string;
+  onError: () => void;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const releaseRef = useRef<(() => void) | null>(null);
+  const posterRef = useRef<string | null>(null);
+  const capturingRef = useRef(false);
+  const mountedRef = useRef(true);
+  const [active, setActive] = useState(false);
+  const [poster, setPoster] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    acquireVideoPreviewSlot().then((release) => {
+      if (cancelled) {
+        release();
+        return;
+      }
+      releaseRef.current = release;
+      setActive(true);
+    });
+
+    return () => {
+      cancelled = true;
+      mountedRef.current = false;
+      releaseRef.current?.();
+      releaseRef.current = null;
+      if (posterRef.current) URL.revokeObjectURL(posterRef.current);
+    };
+  }, []);
+
+  const release = () => {
+    releaseRef.current?.();
+    releaseRef.current = null;
+    if (mountedRef.current) setActive(false);
+  };
+
+  const captureFrame = () => {
+    const video = videoRef.current;
+    if (
+      capturingRef.current ||
+      !video ||
+      video.videoWidth === 0 ||
+      video.videoHeight === 0
+    ) {
+      return;
+    }
+    capturingRef.current = true;
+    const scale = Math.min(1, 640 / video.videoWidth, 360 / video.videoHeight);
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+    canvas.getContext('2d')?.drawImage(video, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) {
+          release();
+          if (mountedRef.current) onError();
+          return;
+        }
+        const url = URL.createObjectURL(blob);
+        if (!mountedRef.current) {
+          URL.revokeObjectURL(url);
+          release();
+          return;
+        }
+        posterRef.current = url;
+        setPoster(url);
+        release();
+      },
+      'image/webp',
+      0.72
+    );
+  };
+
+  if (poster) {
+    return <img src={poster} alt="" className="h-full w-full object-cover" />;
+  }
+
+  if (!active) {
+    return (
+      <div className="flex h-full w-full items-center justify-center">
+        <Video className="h-9 w-9 text-slate-600" />
+      </div>
+    );
+  }
+
+  return (
+    <video
+      ref={videoRef}
+      src={mediaUrl}
+      aria-label={`Loading preview for ${name}`}
+      muted
+      playsInline
+      preload="metadata"
+      onLoadedMetadata={(event) => {
+        event.currentTarget.currentTime = Math.min(0.1, event.currentTarget.duration || 0.1);
+      }}
+      onLoadedData={captureFrame}
+      onSeeked={captureFrame}
+      onError={() => {
+        release();
+        onError();
+      }}
+      className="h-full w-full object-cover"
+    />
   );
 }
 
@@ -349,4 +555,78 @@ function formatSize(bytes: number) {
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
   const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function formatDate(value: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date(value));
+}
+
+function sortItems(items: FtpItem[], order: SortOrder) {
+  if (order === 'default') return items;
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => {
+      let result = 0;
+      if (order === 'name-asc' || order === 'name-desc') {
+        result = a.item.name.localeCompare(b.item.name, undefined, {
+          numeric: true,
+          sensitivity: 'base',
+        });
+        if (order === 'name-desc') result *= -1;
+      } else if (order === 'size-desc' || order === 'size-asc') {
+        result = a.item.size - b.item.size;
+        if (order === 'size-desc') result *= -1;
+      } else {
+        const aTime = a.item.modifiedAt ? Date.parse(a.item.modifiedAt) : Number.NaN;
+        const bTime = b.item.modifiedAt ? Date.parse(b.item.modifiedAt) : Number.NaN;
+        if (Number.isNaN(aTime) && Number.isNaN(bTime)) result = 0;
+        else if (Number.isNaN(aTime)) result = 1;
+        else if (Number.isNaN(bTime)) result = -1;
+        else result = aTime - bTime;
+        if (order === 'newest') result *= -1;
+      }
+      return result || a.index - b.index;
+    })
+    .map(({ item }) => item);
+}
+
+function isSortOrder(value: string | null): value is SortOrder {
+  return [
+    'default',
+    'newest',
+    'oldest',
+    'name-asc',
+    'name-desc',
+    'size-desc',
+    'size-asc',
+  ].includes(value || '');
+}
+
+function acquireVideoPreviewSlot(): Promise<() => void> {
+  return new Promise((resolve) => {
+    const start = (release: () => void) => resolve(release);
+    videoPreviewQueue.push(start);
+    runVideoPreviewQueue();
+  });
+}
+
+function runVideoPreviewQueue() {
+  while (activeVideoPreviews < MAX_VIDEO_PREVIEWS && videoPreviewQueue.length > 0) {
+    const start = videoPreviewQueue.shift();
+    if (!start) return;
+    activeVideoPreviews += 1;
+    let released = false;
+    start(() => {
+      if (released) return;
+      released = true;
+      activeVideoPreviews = Math.max(0, activeVideoPreviews - 1);
+      runVideoPreviewQueue();
+    });
+  }
 }

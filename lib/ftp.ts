@@ -40,20 +40,11 @@ export async function listFtpDirectory(config: FtpConfig, path: string): Promise
         type = 'link';
       }
 
-      let modifiedStr = new Date().toISOString();
-      if (item.modifiedAt) {
-        if (item.modifiedAt instanceof Date) {
-          modifiedStr = item.modifiedAt.toISOString();
-        } else {
-          modifiedStr = String(item.modifiedAt);
-        }
-      }
-
       return {
         name: item.name,
         type,
         size: item.size,
-        modifiedAt: modifiedStr,
+        modifiedAt: resolveItemDate(item.name, item.modifiedAt, item.rawModifiedAt),
       };
     });
   } finally {
@@ -237,4 +228,54 @@ function splitRemotePath(remotePath: string) {
     directory: segments.length > 0 ? `/${segments.join('/')}` : '/',
     name,
   };
+}
+
+function resolveItemDate(
+  name: string,
+  modifiedAt?: Date,
+  rawModifiedAt?: string
+): string | null {
+  if (modifiedAt instanceof Date && !Number.isNaN(modifiedAt.getTime())) {
+    return modifiedAt.toISOString();
+  }
+
+  // Xiaomi camera files preserve their capture timestamp in the filename.
+  const filenameDate = /(?:^|[_-])((?:19|20)\d{2})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})/.exec(name);
+  if (filenameDate) {
+    const [, year, month, day, hour, minute, second] = filenameDate;
+    const timestamp = Date.UTC(
+      Number(year),
+      Number(month) - 1,
+      Number(day),
+      Number(hour),
+      Number(minute),
+      Number(second)
+    );
+    if (!Number.isNaN(timestamp)) return new Date(timestamp).toISOString();
+  }
+
+  if (!rawModifiedAt) return null;
+  const withYear = /^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})$/.exec(rawModifiedAt.trim());
+  if (withYear) {
+    const timestamp = Date.parse(`${withYear[1]} ${withYear[2]}, ${withYear[3]} UTC`);
+    return Number.isNaN(timestamp) ? null : new Date(timestamp).toISOString();
+  }
+
+  // Standard FTP LIST omits the year for recent files. Pick the nearest
+  // non-future occurrence; this is necessarily approximate for older servers.
+  const recent = /^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{1,2}):(\d{2})$/.exec(rawModifiedAt.trim());
+  if (recent) {
+    const now = new Date();
+    let timestamp = Date.parse(
+      `${recent[1]} ${recent[2]}, ${now.getUTCFullYear()} ${recent[3]}:${recent[4]} UTC`
+    );
+    if (timestamp > now.getTime() + 24 * 60 * 60 * 1000) {
+      timestamp = Date.parse(
+        `${recent[1]} ${recent[2]}, ${now.getUTCFullYear() - 1} ${recent[3]}:${recent[4]} UTC`
+      );
+    }
+    return Number.isNaN(timestamp) ? null : new Date(timestamp).toISOString();
+  }
+
+  return null;
 }
